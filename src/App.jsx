@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import MonitorUI from "./components/MonitorUI";
+import Histogram from "./components/Histogram";
 import { useWebGLRenderer } from "./hooks/useWebGLRenderer";
 import { generateDefaultLUT, parseCubeFile } from "./utils/lutParser";
 
@@ -11,13 +12,22 @@ export default function App() {
   const [devices, setDevices] = useState([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   
-  // App UI states
-  const [activeLUT, setActiveLUT] = useState(null);
+  // App UI/LUT states
+  const [lutList, setLutList] = useState([]);
+  const [selectedLutId, setSelectedLutId] = useState("default");
+  const [lutEnabled, setLutEnabled] = useState(true);
   const [resolution, setResolution] = useState("0x0");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [toast, setToast] = useState(null);
   const [directWiFiMode, setDirectWiFiMode] = useState(false);
   const [directBlobUrl, setDirectBlobUrl] = useState(null);
+
+  // Advanced Overlay & Format Toggles
+  const [showHistogram, setShowHistogram] = useState(true);
+  const [uvcResolution, setUvcResolution] = useState(1080); // 1080, 720, 480
+  const [uvcFrameRate, setUvcFrameRate] = useState(60);     // 60, 30
+  const [sonyLiveviewSize, setSonyLiveviewSize] = useState("L"); // L, M, S
+  const [cameraStatus, setCameraStatus] = useState(null); // { iso, shutter, aperture, battery }
 
   const canvasRef = useRef(null);
   const videoRef = useRef(null);
@@ -30,7 +40,9 @@ export default function App() {
   // Initialize the default mathematically computed S-Log3 to Rec.709 LUT
   useEffect(() => {
     const defaultLUT = generateDefaultLUT();
-    setActiveLUT(defaultLUT);
+    const defaultItem = { id: "default", name: "S-Log3 to Rec.709 (Default)", data: defaultLUT };
+    setLutList([defaultItem]);
+    setSelectedLutId("default");
   }, []);
 
   // Helper to show auto-expiring toast messages
@@ -50,10 +62,10 @@ export default function App() {
     // If it's already a relative path or proxied URL, return it
     if (url.startsWith("/") || url.startsWith("blob:")) return url;
     
-    // Route Sony WiFi direct streams to our specialized parser
+    // Route Sony WiFi direct streams to our specialized parser with dynamic size parameters
     if (url.startsWith("sony://")) {
       const ip = url.replace("sony://", "") || "192.168.122.1";
-      return `/api/sony-liveview?ip=${ip}`;
+      return `/api/sony-liveview?ip=${ip}&size=${sonyLiveviewSize}`;
     }
 
     // Encode the target URL and wrap it in our server proxy endpoint
@@ -63,8 +75,12 @@ export default function App() {
   // Determine active source element based on selected input mode
   const activeSourceRef = sourceType === "uvc" ? videoRef : imageRef;
 
-  // Bind WebGL Rendering Engine to our canvas & active input source
-  const { error: webGLError, fps } = useWebGLRenderer(canvasRef, activeSourceRef, sourceType, activeLUT);
+  // Derive current active LUT data
+  const activeLUTItem = lutList.find(item => item.id === selectedLutId);
+  const activeLUT = activeLUTItem ? activeLUTItem.data : null;
+
+  // Bind WebGL Rendering Engine to our canvas & active input source with bypass uniform support
+  const { error: webGLError, fps } = useWebGLRenderer(canvasRef, activeSourceRef, sourceType, activeLUT, lutEnabled);
 
   // Monitor WebGL errors and report via toast
   useEffect(() => {
@@ -82,8 +98,6 @@ export default function App() {
       }
       try {
         // Request temporary stream to trigger browser webcam prompt.
-        // This is crucial because standard browsers (including iPadOS Safari)
-        // hide device labels until explicit stream permissions are granted.
         const initialStream = await navigator.mediaDevices.getUserMedia({ video: true });
         
         // Release initial stream tracks immediately
@@ -162,7 +176,7 @@ export default function App() {
     }
   }, [sourceType]);
 
-  // Manage UVC capture stream based on selected device ID and active source type
+  // Manage UVC capture stream based on selected device ID, active source type, resolution, and frame rate
   useEffect(() => {
     if (sourceType !== "uvc" || !selectedDeviceId || !navigator.mediaDevices) return;
 
@@ -172,12 +186,14 @@ export default function App() {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
 
+      const targetWidth = uvcResolution === 1080 ? 1920 : uvcResolution === 720 ? 1280 : 640;
+
       const constraints = {
         video: {
           deviceId: { exact: selectedDeviceId },
-          width: { ideal: 1920 }, // target high quality HD input
-          height: { ideal: 1080 },
-          frameRate: { ideal: 60 } // attempt to monitor at 60fps
+          width: { ideal: targetWidth },
+          height: { ideal: uvcResolution },
+          frameRate: { ideal: uvcFrameRate }
         },
         audio: false
       };
@@ -201,7 +217,51 @@ export default function App() {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
     };
-  }, [selectedDeviceId, sourceType]);
+  }, [selectedDeviceId, sourceType, uvcResolution, uvcFrameRate]);
+
+  // Polling loop for active Sony camera status settings
+  useEffect(() => {
+    if (sourceType !== "network" || !activeStreamUrl) {
+      setCameraStatus(null);
+      return;
+    }
+
+    const ip = activeStreamUrl.replace("sony://", "").replace("sony-direct://", "") || "192.168.122.1";
+    let active = true;
+    let timer = null;
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch(`/api/sony-status?ip=${ip}`);
+        if (!res.ok) throw new Error("HTTP error");
+        const data = await res.json();
+        if (active) {
+          setCameraStatus(data);
+        }
+      } catch (err) {
+        // Silently catch polling issues if camera goes offline temporarily
+      }
+    }
+
+    fetchStatus();
+    timer = setInterval(fetchStatus, 2000);
+
+    return () => {
+      active = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [activeStreamUrl, sourceType]);
+
+  // Force reconnect on Sony liveview size change
+  useEffect(() => {
+    if (sourceType === "network" && activeStreamUrl) {
+      const current = activeStreamUrl;
+      setActiveStreamUrl("");
+      setTimeout(() => {
+        setActiveStreamUrl(current);
+      }, 150);
+    }
+  }, [sonyLiveviewSize]);
 
   // Manage Direct Client-Side WiFi stream parsing (No PC Proxy)
   useEffect(() => {
@@ -223,23 +283,39 @@ export default function App() {
     async function startDirectStream() {
       const ip = activeStreamUrl.replace("sony://", "").replace("sony-direct://", "") || "192.168.122.1";
       
-      // 1. Send startLiveview JSON-RPC POST call directly to camera
+      // 1. Send startRecMode
       try {
-        await fetch(`http://${ip}:8080/sony/camera`, {
+        await fetch(`http://${ip}:10000/sony/camera`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            method: "startLiveview",
+            method: "startRecMode",
             params: [],
             id: 1,
             version: "1.0"
           })
         });
       } catch (e) {
-        console.log("Direct startLiveview failed/blocked (CORS likely), attempting stream connection anyway:", e.message);
+        console.log("Direct startRecMode failed/blocked (CORS likely).");
       }
 
-      const streamAddr = `http://${ip}:8080/liveview/liveviewstream`;
+      // 2. Send startLiveviewWithSize
+      try {
+        await fetch(`http://${ip}:10000/sony/camera`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            method: "startLiveviewWithSize",
+            params: [sonyLiveviewSize],
+            id: 1,
+            version: "1.0"
+          })
+        });
+      } catch (e) {
+        console.log("Direct startLiveviewWithSize failed/blocked (CORS likely).");
+      }
+
+      const streamAddr = `http://${ip}:60152/liveviewstream`;
 
       try {
         const response = await fetch(streamAddr);
@@ -358,7 +434,7 @@ export default function App() {
         return null;
       });
     };
-  }, [activeStreamUrl, sourceType, directWiFiMode]);
+  }, [activeStreamUrl, sourceType, directWiFiMode, sonyLiveviewSize]);
 
   // Handle custom .cube LUT uploads
   const handleUploadLUT = (file) => {
@@ -367,8 +443,10 @@ export default function App() {
       try {
         const text = e.target.result;
         const parsed = parseCubeFile(text, file.name);
-        setActiveLUT(parsed);
-        showToast(`LUT "${parsed.title}" loaded successfully.`, "success");
+        const newItem = { id: file.name + Date.now(), name: parsed.title || file.name, data: parsed };
+        setLutList(prev => [...prev, newItem]);
+        setSelectedLutId(newItem.id);
+        showToast(`LUT "${parsed.title || file.name}" loaded successfully.`, "success");
       } catch (err) {
         showToast(`Failed to parse LUT file: ${err.message}`, "error");
       }
@@ -376,10 +454,9 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  // Reset LUT back to our mathematically computed Rec.709 matrix
+  // Reset LUT selection
   const handleResetLUT = () => {
-    const defaultLUT = generateDefaultLUT();
-    setActiveLUT(defaultLUT);
+    setSelectedLutId("default");
     showToast("Reset to default mathematical S-Log3 to Rec.709 conversion.", "success");
   };
 
@@ -452,6 +529,13 @@ export default function App() {
         }}
       />
 
+      {/* Floating Histogram Overlay (Luma + RGB curves) */}
+      {showHistogram && (
+        <div style={{ position: "absolute", bottom: "90px", left: "20px", zIndex: 10, pointerEvents: "none" }}>
+          <Histogram sourceRef={activeSourceRef} active={showHistogram} />
+        </div>
+      )}
+
       {/* Modern Cinema HUD and Controls Overlay */}
       <MonitorUI
         devices={devices}
@@ -461,7 +545,7 @@ export default function App() {
         onChangeSourceType={setSourceType}
         streamUrl={streamUrl}
         onChangeStreamUrl={setStreamUrl}
-        activeLUTName={activeLUT ? activeLUT.title : "Default S-Log3"}
+        activeLUTName={activeLUTItem ? activeLUTItem.name : "Default S-Log3"}
         onUploadLUT={handleUploadLUT}
         onResetLUT={handleResetLUT}
         fps={fps}
@@ -472,6 +556,22 @@ export default function App() {
         directWiFiMode={directWiFiMode}
         onChangeDirectWiFiMode={setDirectWiFiMode}
         onConnectStream={handleConnectStream}
+        
+        // Advanced Controls & Telemetry props
+        lutEnabled={lutEnabled}
+        onChangeLutEnabled={setLutEnabled}
+        lutList={lutList}
+        selectedLutId={selectedLutId}
+        onSelectLut={setSelectedLutId}
+        uvcResolution={uvcResolution}
+        onChangeUvcResolution={setUvcResolution}
+        uvcFrameRate={uvcFrameRate}
+        onChangeUvcFrameRate={setUvcFrameRate}
+        sonyLiveviewSize={sonyLiveviewSize}
+        onChangeSonyLiveviewSize={setSonyLiveviewSize}
+        showHistogram={showHistogram}
+        onChangeShowHistogram={setShowHistogram}
+        cameraStatus={cameraStatus}
       />
     </div>
   );

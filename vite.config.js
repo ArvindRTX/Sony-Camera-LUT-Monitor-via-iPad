@@ -147,6 +147,7 @@ const corsProxyPlugin = () => ({
     server.middlewares.use('/api/sony-liveview', (req, res) => {
       const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const cameraIp = urlObj.searchParams.get('ip') || '192.168.122.1';
+      const size = urlObj.searchParams.get('size') || 'L'; // L, M, S
       
       // Set headers for MJPEG multipart streaming
       res.writeHead(200, {
@@ -157,10 +158,10 @@ const corsProxyPlugin = () => ({
         'Access-Control-Allow-Origin': '*'
       });
 
-      const sendRPC = (method, callback) => {
+      const sendRPC = (method, params, callback) => {
         const payload = JSON.stringify({
           method: method,
-          params: [],
+          params: params,
           id: 1,
           version: '1.0'
         });
@@ -194,29 +195,39 @@ const corsProxyPlugin = () => ({
         rpcReq.end();
       };
 
-      // Chained execution: 1. startRecMode -> 2. startLiveview
-      console.log(`[Sony WiFi] Initializing session on ${cameraIp}:10000...`);
-      sendRPC('startRecMode', (err, recResult) => {
+      // Chained execution: 1. startRecMode -> 2. startLiveviewWithSize (falling back to startLiveview if needed)
+      console.log(`[Sony WiFi] Initializing session on ${cameraIp}:10000 (Size: ${size})...`);
+      sendRPC('startRecMode', [], (err, recResult) => {
         if (err) {
           console.log(`[Sony WiFi] startRecMode failed: ${err.message}. Proceeding to startLiveview...`);
         } else {
-          console.log(`[Sony WiFi] startRecMode initialized successfully:`, JSON.stringify(recResult));
+          console.log(`[Sony WiFi] startRecMode initialized successfully.`);
         }
 
         // Wait a short moment for mode transition, then trigger liveview stream
         setTimeout(() => {
-          sendRPC('startLiveview', (err, lvResult) => {
+          sendRPC('startLiveviewWithSize', [size], (err, lvResult) => {
             let streamUrl = `http://${cameraIp}:10000/liveview/liveviewstream`;
-            if (err) {
-              console.log(`[Sony WiFi] startLiveview failed: ${err.message}. Fallback to direct streaming...`);
+            
+            if (err || (lvResult && lvResult.error)) {
+              console.log(`[Sony WiFi] startLiveviewWithSize failed. Attempting standard startLiveview...`);
+              sendRPC('startLiveview', [], (err2, lvResult2) => {
+                if (lvResult2 && lvResult2.result && lvResult2.result[0]) {
+                  streamUrl = lvResult2.result[0];
+                  console.log(`[Sony WiFi] Stream URL retrieved: ${streamUrl}`);
+                } else {
+                  console.log(`[Sony WiFi] Standard startLiveview failed, using default stream path.`);
+                }
+                startStreaming(streamUrl);
+              });
             } else if (lvResult && lvResult.result && lvResult.result[0]) {
               streamUrl = lvResult.result[0];
               console.log(`[Sony WiFi] Stream URL retrieved: ${streamUrl}`);
+              startStreaming(streamUrl);
             } else {
-              console.log(`[Sony WiFi] No stream URL returned in RPC response, using default path.`);
+              console.log(`[Sony WiFi] No stream URL returned, using default stream path.`);
+              startStreaming(streamUrl);
             }
-
-            startStreaming(streamUrl);
           });
         }, 100);
       });
@@ -252,6 +263,70 @@ const corsProxyPlugin = () => ({
           res.end(`Streaming setup error: ${e.message}`);
         }
       }
+    });
+
+    // Route 3: Sony Camera Status Metrics (ISO, Shutter, Aperture, Battery)
+    server.middlewares.use('/api/sony-status', (req, res) => {
+      const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const cameraIp = urlObj.searchParams.get('ip') || '192.168.122.1';
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      });
+
+      const payload = JSON.stringify({
+        method: 'getEvent',
+        params: [false],
+        id: 1,
+        version: '1.0'
+      });
+
+      const rpcReq = http.request({
+        host: cameraIp,
+        port: 10000,
+        path: '/sony/camera',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload)
+        }
+      }, (rpcRes) => {
+        let body = '';
+        rpcRes.on('data', chunk => body += chunk);
+        rpcRes.on('end', () => {
+          let status = { iso: 'N/A', shutter: 'N/A', aperture: 'N/A', battery: 'N/A' };
+          try {
+            const json = JSON.parse(body);
+            if (json.result && Array.isArray(json.result)) {
+              json.result.forEach(item => {
+                if (!item) return;
+                if (item.type === 'isoSpeedRate' && item.currentIsoSpeedRate) {
+                  status.iso = item.currentIsoSpeedRate;
+                } else if (item.type === 'shutterSpeed' && item.currentShutterSpeed) {
+                  status.shutter = item.currentShutterSpeed;
+                } else if (item.type === 'fNumber' && item.currentFNumber) {
+                  status.aperture = `f/${item.currentFNumber}`;
+                } else if (item.type === 'batteryInfo' && item.batteryInfo) {
+                  if (item.batteryInfo[0]) {
+                    status.battery = `${item.batteryInfo[0].batteryLevelPct}%`;
+                  }
+                }
+              });
+            }
+          } catch (e) {
+            // Silence JSON parse error if camera returns HTML or garbage
+          }
+          res.end(JSON.stringify(status));
+        });
+      });
+
+      rpcReq.on('error', (err) => {
+        res.end(JSON.stringify({ iso: 'Offline', shutter: 'Offline', aperture: 'Offline', battery: 'Offline' }));
+      });
+
+      rpcReq.write(payload);
+      rpcReq.end();
     });
   }
 });

@@ -22,21 +22,27 @@ out vec4 outColor;
 uniform sampler2D u_videoFrame;
 uniform sampler3D u_lutTexture;
 uniform float u_lutSize;
+uniform bool u_lutEnabled;
 
 void main() {
   // Sample S-Log3 raw video/image color
   vec4 rawColor = texture(u_videoFrame, v_texCoord);
 
-  // Coordinate transformation for exact 3D LUT mapping.
-  // We map the range [0.0, 1.0] to [0.5 / size, (size - 0.5) / size]
-  // to prevent bleeding at the boundaries and align with texel centers.
-  vec3 lutCoord = rawColor.rgb * ((u_lutSize - 1.0) / u_lutSize) + (0.5 / u_lutSize);
+  if (u_lutEnabled) {
+    // Coordinate transformation for exact 3D LUT mapping.
+    // We map the range [0.0, 1.0] to [0.5 / size, (size - 0.5) / size]
+    // to prevent bleeding at the boundaries and align with texel centers.
+    vec3 lutCoord = rawColor.rgb * ((u_lutSize - 1.0) / u_lutSize) + (0.5 / u_lutSize);
 
-  // Sample the color-corrected value from the 3D LUT texture
-  vec3 correctedColor = texture(u_lutTexture, lutCoord).rgb;
+    // Sample the color-corrected value from the 3D LUT texture
+    vec3 correctedColor = texture(u_lutTexture, lutCoord).rgb;
 
-  // Output color with original video alpha
-  outColor = vec4(correctedColor, rawColor.a);
+    // Output color with original video alpha
+    outColor = vec4(correctedColor, rawColor.a);
+  } else {
+    // Bypass LUT color grading, render raw S-Log3 feed directly
+    outColor = rawColor;
+  }
 }
 `;
 
@@ -68,12 +74,17 @@ function createProgram(gl, vsSource, fsSource) {
   return program;
 }
 
-export function useWebGLRenderer(canvasRef, sourceRef, sourceType, lutData) {
+export function useWebGLRenderer(canvasRef, sourceRef, sourceType, lutData, lutEnabled) {
   const [error, setError] = useState(null);
   const [fps, setFps] = useState(0);
   const requestRef = useRef(null);
   const lastTimeRef = useRef(performance.now());
   const frameCountRef = useRef(0);
+  const lutEnabledRef = useRef(lutEnabled);
+
+  useEffect(() => {
+    lutEnabledRef.current = lutEnabled;
+  }, [lutEnabled]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -169,10 +180,12 @@ export function useWebGLRenderer(canvasRef, sourceRef, sourceType, lutData) {
       const u_videoFrameLoc = gl.getUniformLocation(program, "u_videoFrame");
       const u_lutTextureLoc = gl.getUniformLocation(program, "u_lutTexture");
       const u_lutSizeLoc = gl.getUniformLocation(program, "u_lutSize");
+      const u_lutEnabledLoc = gl.getUniformLocation(program, "u_lutEnabled");
 
       gl.uniform1i(u_videoFrameLoc, 0); // maps to gl.TEXTURE0
       gl.uniform1i(u_lutTextureLoc, 1); // maps to gl.TEXTURE1
       gl.uniform1f(u_lutSizeLoc, lutData.size);
+      gl.uniform1i(u_lutEnabledLoc, lutEnabledRef.current ? 1 : 0);
 
     } catch (err) {
       setError(err.message);
@@ -256,6 +269,10 @@ export function useWebGLRenderer(canvasRef, sourceRef, sourceType, lutData) {
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.useProgram(program);
         gl.bindVertexArray(vao);
+
+        // Update LUT enabled uniform
+        const u_lutEnabledLoc = gl.getUniformLocation(program, "u_lutEnabled");
+        gl.uniform1i(u_lutEnabledLoc, lutEnabledRef.current ? 1 : 0);
 
         // Upload new video/image frame to GPU texture
         gl.activeTexture(gl.TEXTURE0);
